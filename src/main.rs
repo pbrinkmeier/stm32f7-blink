@@ -2,17 +2,40 @@
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
+#![feature(alloc)]
 
-use stm32f7_discovery::{
-    gpio::{GpioPort, OutputPin},
-    init,
-    system_clock::{self, Hz}
-};
-use stm32f7::stm32f7x6::{CorePeripherals, Peripherals};
+#[macro_use]
+extern crate alloc;
+extern crate alloc_cortex_m;
+extern crate cortex_m;
+extern crate cortex_m_rt as rt;
+extern crate cortex_m_semihosting as sh;
+extern crate stm32f7;
+extern crate stm32f7_discovery;
+extern crate smoltcp;
+
+use alloc::vec::Vec;
 use alloc_cortex_m::CortexMHeap;
 use core::alloc::Layout as AllocLayout;
 use core::panic::PanicInfo;
-use cortex_m_rt::{entry, exception};
+use cortex_m_rt::{self, entry, exception};
+use smoltcp::{
+    socket::{Socket, SocketSet, TcpSocket, TcpSocketBuffer},
+    time::Instant,
+    wire::{EthernetAddress, IpEndpoint, Ipv4Address},
+};
+use stm32f7::stm32f7x6::{
+    CorePeripherals, Peripherals,
+};
+use stm32f7_discovery::{
+    ethernet,
+    gpio::{GpioPort, OutputPin},
+    init,
+    system_clock::{self, Hz},
+    lcd,
+    print,
+    println
+};
 
 // Enables us to put stuff on the heap
 #[global_allocator]
@@ -36,6 +59,10 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
+const ETH_ADDR: EthernetAddress = EthernetAddress([0x00, 0x08, 0xdc, 0xab, 0xcd, 0xef]);
+
+const HEAP_SIZE: usize = 50 * 1024;
+
 #[entry]
 fn blub() -> ! {
     // Acquire systick
@@ -47,6 +74,12 @@ fn blub() -> ! {
     let mut rcc = peripherals.RCC;
     let mut pwr = peripherals.PWR;
     let mut flash = peripherals.FLASH;
+    let mut fmc = peripherals.FMC;
+    let mut ltdc = peripherals.LTDC;
+    let mut syscfg = peripherals.SYSCFG;
+    let mut ethernet_mac = peripherals.ETHERNET_MAC;
+    let mut ethernet_dma = peripherals.ETHERNET_DMA;
+
     init::init_system_clock_216mhz(&mut rcc, &mut pwr, &mut flash);
     init::enable_gpio_ports(&mut rcc);
 
@@ -62,17 +95,113 @@ fn blub() -> ! {
         GpioPort::new(peripherals.GPIOH),
         GpioPort::new(peripherals.GPIOI),
         GpioPort::new(peripherals.GPIOJ),
-        GpioPort::new(peripherals.GPIOK)
+        GpioPort::new(peripherals.GPIOK),
     );
 
     // Initialize systick
     init::init_systick(Hz(20), &mut systick, &rcc);
     systick.enable_interrupt();
 
-    pins.led.set(true);
+    // Enable SDRAM (prereq for LCD)
+    init::init_sdram(&mut rcc, &mut fmc);
+    // Initialize LCD
+    let mut lcd = init::init_lcd(&mut ltdc, &mut rcc);
+    // Enable display and backlight
+    pins.display_enable.set(true);
+    pins.backlight.set(true);
+
+    let mut layer_1 = lcd.layer_1().unwrap();
+    let mut layer_2 = lcd.layer_2().unwrap();
+    layer_1.clear();
+    layer_2.clear();
+    lcd::init_stdout(layer_2);
+
+    unsafe { ALLOCATOR.init(cortex_m_rt::heap_start() as usize, HEAP_SIZE) }
+
+    let mut ethernet_interface = ethernet::EthernetDevice::new(
+        Default::default(),
+        Default::default(),
+        &mut rcc,
+        &mut syscfg,
+        &mut ethernet_mac,
+        &mut ethernet_dma,
+        ETH_ADDR,
+    )
+    .map(|device| {
+        let iface = device.into_interface();
+        let ip_addr = iface.ipv4_addr().unwrap();
+        (iface, ip_addr)
+    });
+    if let Err(e) = ethernet_interface {
+        println!("Ethernet init failed: {:?}", e);
+    }
+
+    let mut sockets = SocketSet::new(Vec::new());
+    let endpoint = IpEndpoint::new(smoltcp::wire::IpAddress::Ipv4(<Ipv4Address>::new(192, 168, 0, 100)), 8000);
+
+    let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; ethernet::MTU]);
+    let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; ethernet::MTU]);
+    let mut tcp_socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
+    tcp_socket.listen(endpoint).unwrap();
+    sockets.add(tcp_socket);
+
     loop {
-        if system_clock::ticks() % 10 == 0 {
-            pins.led.toggle();
+        if let Ok((ref mut iface, ref mut _ip_addr)) = ethernet_interface {
+            let timestamp = Instant::from_millis(system_clock::ms() as i64);
+
+            match iface.poll(&mut sockets, timestamp) {
+                Err(::smoltcp::Error::Exhausted) => {
+                    println!("Exhausted");
+                    continue;
+                }
+                Err(::smoltcp::Error::Unrecognized) => println!("Unrecognized"),
+                Err(e) => println!("Network error: {:?}", e),
+                Ok(socket_changed) => {
+                    if socket_changed {
+                        for mut socket in sockets.iter_mut() {
+                            println!("polling socket...");
+                            poll_socket(&mut socket).expect("socket poll failed");
+                        }
+                    }
+                }
+            }
         }
     }
+}
+
+fn poll_socket(socket: &mut Socket) -> Result<(), smoltcp::Error> {
+    match socket {
+        &mut Socket::Tcp(ref mut socket) => match socket.local_endpoint().port {
+            8000 => {
+                println!("port 8000");
+                if !socket.may_recv() {
+                    println!("may_recv");
+                    return Ok(());
+                }
+                println!("check 1");
+                let reply = socket.recv(|data| {
+                    if data.len() > 0 {
+                        println!("check 2");
+                        let mut reply = Vec::from("tcp: ");
+                        let start_index = reply.len();
+                        reply.extend_from_slice(data);
+                        reply[start_index..(start_index + data.len() - 1)].reverse();
+                        (data.len(), Some(reply))
+                    } else {
+                        println!("check 3");
+                        (data.len(), None)
+                    }
+                })?;
+                println!("check 4");
+                if let Some(reply) = reply {
+                    assert_eq!(socket.send_slice(&reply)?, reply.len());
+                }
+            }
+            _ => {}
+        },
+        _ => {
+            println!("no port matched");
+        }
+    }
+    Ok(())
 }
