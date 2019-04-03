@@ -70,9 +70,12 @@ fn blub() -> ! {
     systick.enable_interrupt();
 
     pins.led.set(true);
+    let mut last_ticks = system_clock::ticks();
     loop {
-        if system_clock::ticks() % 10 == 0 {
+        let curr_ticks = system_clock::ticks();
+        if curr_ticks - last_ticks >= 10 {
             pins.led.toggle();
+            last_ticks = curr_ticks;
         }
     }
 }
